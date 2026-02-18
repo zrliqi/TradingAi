@@ -1,5 +1,4 @@
 import os
-import os
 import queue
 import sys
 import threading
@@ -7,8 +6,16 @@ import tkinter as tk
 from tkinter import messagebox, scrolledtext
 import webbrowser
 
+from license.licensing import (
+    DEFAULT_LICENSE_PATH,
+    LicenseError,
+    generate_machine_id,
+    is_license_active,
+    load_license_file,
+    save_activation_key_file,
+    validate_license,
+)
 from resource_path import resource_path
-from subscription.subscription_manager import SubscriptionManager
 
 
 class GuiLogStream:
@@ -38,8 +45,6 @@ class TradingBotGUI:
     SPLASH_WIDTH = 420
     SPLASH_HEIGHT = 240
     SPLASH_LOGO_SCALE = 0.5
-    TRIAL_WIDTH = 420
-    TRIAL_HEIGHT = 300
 
     def __init__(self, root):
         self.root = root
@@ -51,20 +56,18 @@ class TradingBotGUI:
         self._splash_logo = None
         self._apply_app_icon()
 
-        self.subscription = SubscriptionManager(
-            app_name="TradingAi",
-            legacy_app_name=["Trading Ai", "TradingBotX"],
-        )
-
         self.root.withdraw()
-        if not self._ensure_trial_started():
-            self.root.destroy()
-            return
         self._show_splash()
 
         self.bot_thread = None
         self.bot = None
         self.ip_monitor = None
+        self.machine_id = generate_machine_id()
+        self.machine_id_var = tk.StringVar(value=self.machine_id)
+        self.license_key_var = tk.StringVar()
+        self.license_result_var = tk.StringVar(value="Paste activation key and click Activate.")
+        self.license_result_color = "blue"
+        self.license_window = None
 
         self.signal_var = tk.StringVar(value="Signal: --")
         self.price_var = tk.StringVar(value="BTC Price: --")
@@ -94,10 +97,18 @@ class TradingBotGUI:
 
         self.status_label = tk.Label(
             root,
-            text="Checking subscription...",
+            text="Checking license...",
             fg="blue"
         )
         self.status_label.pack(pady=5)
+
+        self.manage_license_btn = tk.Button(
+            root,
+            text="Manage License",
+            width=20,
+            command=self.open_license_window,
+        )
+        self.manage_license_btn.pack(pady=4)
 
         self.alert_var = tk.StringVar(value="Alert: --")
         self.alert_label = tk.Label(
@@ -145,7 +156,8 @@ class TradingBotGUI:
 
         self.root.deiconify()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.check_subscription()
+        if not self.check_license():
+            self.open_license_window()
 
     def _build_link_buttons(self):
         container = tk.Frame(self.root)
@@ -177,141 +189,94 @@ class TradingBotGUI:
             ),
         ).grid(row=0, column=1, padx=8)
 
+    def open_license_window(self):
+        if self.license_window is not None and self.license_window.winfo_exists():
+            self.license_window.lift()
+            self.license_window.focus_force()
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("License Activation")
+        win.resizable(False, False)
+        self._apply_app_icon(win)
+        self.license_window = win
+
+        frame = tk.Frame(win, padx=14, pady=12)
+        frame.pack()
+
+        tk.Label(
+            frame,
+            text="Machine ID",
+            font=("Arial", 9, "bold"),
+        ).pack()
+
+        machine_entry = tk.Entry(
+            frame,
+            textvariable=self.machine_id_var,
+            width=62,
+            state="readonly",
+            justify="center",
+        )
+        machine_entry.pack(pady=(2, 4))
+
+        button_row = tk.Frame(frame)
+        button_row.pack(pady=(0, 8))
+
+        tk.Button(
+            button_row,
+            text="Copy Machine ID",
+            width=16,
+            command=self.copy_machine_id,
+        ).pack(side="left", padx=4)
+
+        tk.Button(
+            button_row,
+            text="Request Key on Discord",
+            width=22,
+            command=lambda: self._open_url("https://discord.gg/GHjeawSYcp"),
+        ).pack(side="left", padx=4)
+
+        tk.Label(
+            frame,
+            text="Activation Key",
+            font=("Arial", 9, "bold"),
+        ).pack()
+
+        self.license_key_entry = tk.Entry(
+            frame,
+            textvariable=self.license_key_var,
+            width=62,
+        )
+        self.license_key_entry.pack(pady=(2, 6))
+        self.license_key_entry.bind("<Return>", lambda _event: self.activate_license())
+
+        self.activate_btn = tk.Button(
+            frame,
+            text="Activate License",
+            width=20,
+            command=self.activate_license,
+        )
+        self.activate_btn.pack(pady=(0, 6))
+
+        self.license_result_label = tk.Label(
+            frame,
+            textvariable=self.license_result_var,
+            fg=self.license_result_color,
+        )
+        self.license_result_label.pack()
+
+        def on_close():
+            self.license_window = None
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", on_close)
+        self.license_key_entry.focus_set()
+
     def _open_url(self, url: str):
         try:
             webbrowser.open_new_tab(url)
         except Exception as exc:
             messagebox.showerror("Open Link", f"Unable to open link.\n{exc}")
-
-    def _ensure_trial_started(self) -> bool:
-        if not self.subscription.needs_trial_start():
-            return True
-        return self._show_trial_start()
-
-    def _show_trial_start(self) -> bool:
-        started = {"value": False}
-
-        trial = tk.Toplevel(self.root)
-        trial.title("Start Trial")
-        trial.resizable(False, False)
-        trial.configure(bg="#0f172a")
-        trial.attributes("-topmost", True)
-        self._apply_app_icon(trial)
-
-        width, height = self.TRIAL_WIDTH, self.TRIAL_HEIGHT
-        trial.update_idletasks()
-        screen_w = trial.winfo_screenwidth()
-        screen_h = trial.winfo_screenheight()
-        x = (screen_w - width) // 2
-        y = (screen_h - height) // 2
-        trial.geometry(f"{width}x{height}+{x}+{y}")
-        trial.update()
-        try:
-            trial.lift()
-            trial.focus_force()
-        except Exception:
-            pass
-
-        container = tk.Frame(trial, bg="#0f172a")
-        container.pack(expand=True, fill="both")
-
-        logo_image = self._load_logo_image(60)
-        if logo_image is not None:
-            self._trial_logo = logo_image
-            tk.Label(
-                container,
-                image=logo_image,
-                bg="#0f172a",
-            ).pack(pady=(18, 6))
-
-        tk.Label(
-            container,
-            text="Start your free trial",
-            font=("Segoe UI", 16, "bold"),
-            fg="#e2e8f0",
-            bg="#0f172a",
-        ).pack(pady=(6, 6))
-
-        tk.Label(
-            container,
-            text=f"Activate your {self.subscription.TRIAL_DAYS}-day trial to continue.",
-            font=("Segoe UI", 11),
-            fg="#94a3b8",
-            bg="#0f172a",
-        ).pack(pady=(0, 18))
-
-        def start_trial():
-            self.subscription.start_trial()
-            started["value"] = True
-            trial.destroy()
-
-        def cancel():
-            started["value"] = False
-            trial.destroy()
-
-        button_row = tk.Frame(container, bg="#0f172a")
-        button_row.pack()
-
-        tk.Button(
-            button_row,
-            text="Start Trial",
-            width=12,
-            command=start_trial,
-        ).pack(side="left", padx=8)
-
-        tk.Button(
-            button_row,
-            text="Exit",
-            width=8,
-            command=cancel,
-        ).pack(side="left", padx=8)
-
-        tk.Label(
-            container,
-            text="Join Learning Program",
-            font=("Segoe UI", 9),
-            fg="#94a3b8",
-            bg="#0f172a",
-        ).pack(pady=(12, 6))
-
-        link_row = tk.Frame(container, bg="#0f172a")
-        link_row.pack(pady=(0, 6))
-
-        link_btn_kwargs = {
-            "width": 11,
-            "font": ("Segoe UI", 9),
-            "fg": "#cbd5f5",
-            "bg": "#3a3f4b",
-            "activeforeground": "#e2e8f0",
-            "activebackground": "#4a5161",
-            "relief": "flat",
-            "bd": 1,
-            "highlightthickness": 1,
-            "highlightbackground": "#4a5161",
-            "cursor": "hand2",
-        }
-
-        tk.Button(
-            link_row,
-            text="Discord",
-            command=lambda: self._open_url("https://discord.gg/GHjeawSYcp"),
-            **link_btn_kwargs,
-        ).pack(side="left", padx=8)
-
-        tk.Button(
-            link_row,
-            text="Binance",
-            command=lambda: self._open_url(
-                "https://accounts.binance.com/register?ref=35023868"
-            ),
-            **link_btn_kwargs,
-        ).pack(side="left", padx=8)
-
-        trial.protocol("WM_DELETE_WINDOW", cancel)
-        trial.grab_set()
-        self.root.wait_window(trial)
-
-        return started["value"]
 
     def _show_splash(self):
         splash = tk.Toplevel(self.root)
@@ -440,6 +405,20 @@ class TradingBotGUI:
         self.alert_var.set(message)
         self.alert_label.config(fg=color)
 
+    def _set_license_result(self, message, color="blue"):
+        self.license_result_var.set(message)
+        self.license_result_color = color
+        if hasattr(self, "license_result_label") and self.license_result_label.winfo_exists():
+            self.license_result_label.config(fg=color)
+
+    def copy_machine_id(self):
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(self.machine_id)
+            self._set_license_result("Machine ID copied to clipboard.", "green")
+        except Exception as exc:
+            self._set_license_result(f"Copy failed: {exc}", "red")
+
     def update_signal(self, value):
         # Tkinter-safe update
         self.root.after(
@@ -454,35 +433,64 @@ class TradingBotGUI:
         self.root.after(0, format_price)
 
     # ===============================
-    # SUBSCRIPTION CHECK
+    # LICENSE CHECK
     # ===============================
-    def check_subscription(self):
-        sub = self.subscription
-
-        if not sub.is_allowed():
-            self.status_label.config(
-                text="❌ Subscription expired",
-                fg="red"
-            )
-            messagebox.showerror(
-                "Access Denied",
-                "Trial expired.\nPlease subscribe to continue."
-            )
+    def activate_license(self):
+        key = self.license_key_var.get().strip()
+        if not key:
+            self._set_license_result("Paste an activation key to continue.", "red")
             return
 
-        if sub.is_trial():
-            days = sub.days_left()
-            self.status_label.config(
-                text=f"⏳ Trial active ({days} days left)",
-                fg="orange"
-            )
-        else:
-            self.status_label.config(
-                text="✅ Subscription active",
-                fg="green"
-            )
+        try:
+            validate_license(key, expected_machine_id=self.machine_id)
+            save_activation_key_file(key)
+        except LicenseError as exc:
+            self._set_license_result(f"Activation failed: {exc}", "red")
+            return
+        except Exception as exc:
+            self._set_license_result(f"Activation failed: {exc}", "red")
+            return
 
+        self._set_license_result("Activation successful.", "green")
+        self.check_license()
+
+    def check_license(self):
+        try:
+            key = load_license_file()
+        except FileNotFoundError:
+            self.status_label.config(
+                text=f"License file not found: {DEFAULT_LICENSE_PATH}",
+                fg="red",
+            )
+            self._set_license_result("No license key saved.", "red")
+            self.start_btn.config(state="disabled")
+            return False
+        except LicenseError as exc:
+            self.status_label.config(
+                text=f"Invalid license file: {exc}",
+                fg="red",
+            )
+            self._set_license_result(f"Invalid license file: {exc}", "red")
+            self.start_btn.config(state="disabled")
+            return False
+
+        active, message = is_license_active(key, expected_machine_id=self.machine_id)
+        if not active:
+            self.status_label.config(
+                text=f"License inactive: {message}",
+                fg="red",
+            )
+            self._set_license_result(f"License inactive: {message}", "red")
+            self.start_btn.config(state="disabled")
+            return False
+
+        self.status_label.config(
+            text=message,
+            fg="green",
+        )
+        self._set_license_result(message, "green")
         self.start_btn.config(state="normal")
+        return True
 
     # ===============================
     # BOT CONTROL
@@ -536,3 +544,5 @@ if __name__ == "__main__":
     root = tk.Tk()
     app = TradingBotGUI(root)
     root.mainloop()
+
+
