@@ -46,7 +46,7 @@ class Variable:
     SYMBOL = os.environ.get("TRADINGAI_SYMBOL", "BTCUSDT")
     RISK = float(os.environ.get("TRADINGAI_RISK", "1"))
     ENTRY_MODE = os.environ.get("TRADINGAI_ENTRY_MODE", "SHORT").upper()
-    ENTRY_SIGNAL = 1600
+    ENTRY_SIGNAL = 1300
     LAVARAGE = 4
     STATIC_DAY = 2
     CANDLE_PATTERN_LOGBACK = "5"

@@ -1,15 +1,18 @@
+import json
 import os
 import queue
 import sys
 import threading
 import tkinter as tk
-from tkinter import messagebox, scrolledtext
 import webbrowser
+from pathlib import Path
+from tkinter import messagebox, scrolledtext
 
 try:
     from license.licensing import (
         DEFAULT_LICENSE_PATH,
         LicenseError,
+        create_activation_key,
         generate_machine_id,
         is_license_active,
         load_license_file,
@@ -20,6 +23,7 @@ except ModuleNotFoundError:
     from licensing import (  # type: ignore
         DEFAULT_LICENSE_PATH,
         LicenseError,
+        create_activation_key,
         generate_machine_id,
         is_license_active,
         load_license_file,
@@ -52,6 +56,10 @@ class GuiLogStream:
 
 
 class TradingBotGUI:
+    TRIAL_DAYS = 7
+    API_KEYS_FILENAME = "binance_keys.json"
+    API_ENV_KEY = "binance_api_key"
+    API_ENV_SECRET = "binance_api_secret"
     SPLASH_DURATION_MS = 1500
     SPLASH_WIDTH = 420
     SPLASH_HEIGHT = 240
@@ -79,6 +87,12 @@ class TradingBotGUI:
         self.license_result_var = tk.StringVar(value="Paste activation key and click Activate.")
         self.license_result_color = "blue"
         self.license_window = None
+        self.api_key_var = tk.StringVar()
+        self.api_secret_var = tk.StringVar()
+        self.api_result_var = tk.StringVar(value="Enter your Binance API key and secret.")
+        self.api_show_secret_var = tk.BooleanVar(value=False)
+        self.api_window = None
+        self.api_keys_ready = False
 
         self.signal_var = tk.StringVar(value="Signal: --")
         self.price_var = tk.StringVar(value="BTC Price: --")
@@ -121,6 +135,22 @@ class TradingBotGUI:
         )
         self.manage_license_btn.pack(pady=4)
 
+        self.manage_api_btn = tk.Button(
+            root,
+            text="Manage API Keys",
+            width=20,
+            command=self.open_api_window,
+        )
+        self.manage_api_btn.pack(pady=4)
+
+        self.trial_btn = tk.Button(
+            root,
+            text="Start Trial",
+            width=20,
+            command=self.start_trial,
+        )
+        self.trial_btn_visible = False
+
         self.alert_var = tk.StringVar(value="Alert: --")
         self.alert_label = tk.Label(
             root,
@@ -160,6 +190,8 @@ class TradingBotGUI:
         self._init_log_stream()
 
         self._build_link_buttons()
+
+        self._ensure_api_keys()
 
         self.root.update_idletasks()
         desired_height = max(320, self.root.winfo_reqheight())
@@ -282,6 +314,206 @@ class TradingBotGUI:
 
         win.protocol("WM_DELETE_WINDOW", on_close)
         self.license_key_entry.focus_set()
+
+    def _api_keys_path(self) -> Path:
+        return Path(DEFAULT_LICENSE_PATH).parent / self.API_KEYS_FILENAME
+
+    def _read_api_keys(self) -> dict:
+        path = self._api_keys_path()
+        if not path.is_file():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _write_api_keys(self, data: dict) -> None:
+        path = self._api_keys_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = Path(f"{path}.tmp")
+        tmp_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        tmp_path.replace(path)
+
+    def _set_api_env(self, key: str, secret: str) -> None:
+        os.environ[self.API_ENV_KEY] = key
+        os.environ[self.API_ENV_KEY.upper()] = key
+        os.environ[self.API_ENV_SECRET] = secret
+        os.environ[self.API_ENV_SECRET.upper()] = secret
+
+    def _load_api_keys_into_vars(self) -> bool:
+        data = self._read_api_keys()
+        key = data.get(self.API_ENV_KEY) or data.get(self.API_ENV_KEY.upper(), "")
+        secret = data.get(self.API_ENV_SECRET) or data.get(self.API_ENV_SECRET.upper(), "")
+
+        self.api_key_var.set(key)
+        self.api_secret_var.set(secret)
+
+        if key and secret:
+            self._set_api_env(key, secret)
+            return True
+        return False
+
+    def _set_api_result(self, message: str, color: str = "blue") -> None:
+        self.api_result_var.set(message)
+        if hasattr(self, "api_result_label") and self.api_result_label.winfo_exists():
+            self.api_result_label.config(fg=color)
+
+    def _toggle_api_secret(self) -> None:
+        if hasattr(self, "api_secret_entry") and self.api_secret_entry.winfo_exists():
+            self.api_secret_entry.config(
+                show="" if self.api_show_secret_var.get() else "*"
+            )
+
+    def _show_trial_button(self) -> None:
+        if self.trial_btn_visible:
+            return
+        self.trial_btn.pack(pady=4, before=self.alert_label)
+        self.trial_btn_visible = True
+
+    def _ensure_api_keys(self) -> None:
+        if self._load_api_keys_into_vars():
+            self.api_keys_ready = True
+            self._show_trial_button()
+            return
+        self.api_keys_ready = False
+        self.open_api_window(require_confirm=True)
+
+    def open_api_window(self, require_confirm: bool = False) -> None:
+        if self.api_window is not None and self.api_window.winfo_exists():
+            self.api_window.lift()
+            self.api_window.focus_force()
+            return
+
+        self._load_api_keys_into_vars()
+        self.api_show_secret_var.set(False)
+        self.api_result_var.set("Enter your Binance API key and secret.")
+
+        win = tk.Toplevel(self.root)
+        win.title("Binance API Keys")
+        win.resizable(False, False)
+        self._apply_app_icon(win)
+        if self.root.state() != "withdrawn":
+            win.transient(self.root)
+        self.api_window = win
+
+        frame = tk.Frame(win, padx=14, pady=12)
+        frame.pack()
+        frame.columnconfigure(0, weight=1)
+
+        tk.Label(
+            frame,
+            text="API Key",
+            font=("Arial", 9, "bold"),
+        ).grid(row=0, column=0, sticky="w")
+
+        self.api_key_entry = tk.Entry(
+            frame,
+            textvariable=self.api_key_var,
+            width=62,
+        )
+        self.api_key_entry.grid(row=1, column=0, pady=(2, 8), sticky="ew")
+
+        tk.Label(
+            frame,
+            text="API Secret",
+            font=("Arial", 9, "bold"),
+        ).grid(row=2, column=0, sticky="w")
+
+        self.api_secret_entry = tk.Entry(
+            frame,
+            textvariable=self.api_secret_var,
+            show="*",
+            width=62,
+        )
+        self.api_secret_entry.grid(row=3, column=0, pady=(2, 6), sticky="ew")
+
+        tk.Checkbutton(
+            frame,
+            text="Show secret",
+            variable=self.api_show_secret_var,
+            command=self._toggle_api_secret,
+        ).grid(row=4, column=0, sticky="w")
+
+        tk.Label(
+            frame,
+            text=f"Saved to: {self._api_keys_path()}",
+            fg="#555555",
+        ).grid(row=5, column=0, pady=(2, 8), sticky="w")
+
+        button_row = tk.Frame(frame)
+        button_row.grid(row=6, column=0, pady=(0, 6))
+
+        tk.Button(
+            button_row,
+            text="Save & Continue",
+            width=18,
+            command=self.save_api_keys,
+        ).pack(side="left", padx=4)
+
+        if not require_confirm:
+            tk.Button(
+                button_row,
+                text="Close",
+                width=10,
+                command=self._close_api_window,
+            ).pack(side="left", padx=4)
+
+        self.api_result_label = tk.Label(
+            frame,
+            textvariable=self.api_result_var,
+            fg="blue",
+        )
+        self.api_result_label.grid(row=7, column=0, sticky="w")
+
+        def on_close():
+            if require_confirm and not self.api_keys_ready:
+                messagebox.showwarning(
+                    "API Key Required",
+                    "Please save your Binance API key and secret to continue.",
+                )
+                return
+            self.api_window = None
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", on_close)
+        self.api_key_entry.focus_set()
+
+        if require_confirm:
+            win.grab_set()
+            self.root.wait_window(win)
+
+    def _close_api_window(self) -> None:
+        if self.api_window is None:
+            return
+        self.api_window.destroy()
+        self.api_window = None
+
+    def save_api_keys(self) -> None:
+        key = self.api_key_var.get().strip()
+        secret = self.api_secret_var.get().strip()
+        if not key or not secret:
+            self._set_api_result("Both fields are required.", "red")
+            return
+
+        data = {
+            self.API_ENV_KEY: key,
+            self.API_ENV_SECRET: secret,
+        }
+        try:
+            self._write_api_keys(data)
+            self._set_api_env(key, secret)
+        except OSError as exc:
+            self._set_api_result(f"Save failed: {exc}", "red")
+            return
+
+        self.api_keys_ready = True
+        self._set_api_result("API keys saved.", "green")
+        self._show_trial_button()
+
+        if self.api_window is not None and self.api_window.winfo_exists():
+            self.api_window.destroy()
+            self.api_window = None
 
     def _open_url(self, url: str):
         try:
@@ -475,6 +707,8 @@ class TradingBotGUI:
             )
             self._set_license_result("No license key saved.", "red")
             self.start_btn.config(state="disabled")
+            if self.trial_btn_visible:
+                self.trial_btn.config(state="normal")
             return False
         except LicenseError as exc:
             self.status_label.config(
@@ -483,6 +717,8 @@ class TradingBotGUI:
             )
             self._set_license_result(f"Invalid license file: {exc}", "red")
             self.start_btn.config(state="disabled")
+            if self.trial_btn_visible:
+                self.trial_btn.config(state="normal")
             return False
 
         active, message = is_license_active(key, expected_machine_id=self.machine_id)
@@ -493,6 +729,8 @@ class TradingBotGUI:
             )
             self._set_license_result(f"License inactive: {message}", "red")
             self.start_btn.config(state="disabled")
+            if self.trial_btn_visible:
+                self.trial_btn.config(state="normal")
             return False
 
         self.status_label.config(
@@ -501,7 +739,62 @@ class TradingBotGUI:
         )
         self._set_license_result(message, "green")
         self.start_btn.config(state="normal")
+        if self.trial_btn_visible:
+            self.trial_btn.config(state="disabled")
         return True
+
+    def start_trial(self):
+        if not self.api_keys_ready:
+            messagebox.showwarning(
+                "API Keys Required",
+                "Please save your Binance API key and secret before starting the trial.",
+            )
+            self.open_api_window()
+            return
+
+        license_path = Path(DEFAULT_LICENSE_PATH)
+        if license_path.exists():
+            try:
+                existing_key = load_license_file()
+                active, message = is_license_active(
+                    existing_key,
+                    expected_machine_id=self.machine_id,
+                )
+                if active:
+                    messagebox.showinfo(
+                        "Trial",
+                        "A license is already active. Trial not started.",
+                    )
+                    return
+                replace = messagebox.askyesno(
+                    "Replace License",
+                    f"Existing license is inactive: {message}. "
+                    "Replace it with a trial license?",
+                )
+                if not replace:
+                    return
+            except LicenseError:
+                replace = messagebox.askyesno(
+                    "Replace License",
+                    "Existing license file is invalid or expired. "
+                    "Replace it with a trial license?",
+                )
+                if not replace:
+                    return
+
+        trial_key = create_activation_key(
+            days=self.TRIAL_DAYS,
+            license_type="trial",
+            machine_id=self.machine_id,
+        )
+        save_activation_key_file(trial_key)
+        self.check_license()
+        messagebox.showinfo(
+            "Trial Started",
+            f"Trial activated for {self.TRIAL_DAYS} days.",
+        )
+        if self.trial_btn_visible:
+            self.trial_btn.config(state="disabled")
 
     # ===============================
     # BOT CONTROL
