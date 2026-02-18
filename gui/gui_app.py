@@ -6,15 +6,26 @@ import tkinter as tk
 from tkinter import messagebox, scrolledtext
 import webbrowser
 
-from license.licensing import (
-    DEFAULT_LICENSE_PATH,
-    LicenseError,
-    generate_machine_id,
-    is_license_active,
-    load_license_file,
-    save_activation_key_file,
-    validate_license,
-)
+try:
+    from license.licensing import (
+        DEFAULT_LICENSE_PATH,
+        LicenseError,
+        generate_machine_id,
+        is_license_active,
+        load_license_file,
+        save_activation_key_file,
+        validate_license,
+    )
+except ModuleNotFoundError:
+    from licensing import (  # type: ignore
+        DEFAULT_LICENSE_PATH,
+        LicenseError,
+        generate_machine_id,
+        is_license_active,
+        load_license_file,
+        save_activation_key_file,
+        validate_license,
+    )
 from resource_path import resource_path
 
 
@@ -544,5 +555,8 @@ if __name__ == "__main__":
     root = tk.Tk()
     app = TradingBotGUI(root)
     root.mainloop()
+
+
+
 
 
