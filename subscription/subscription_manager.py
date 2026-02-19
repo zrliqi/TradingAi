@@ -12,7 +12,7 @@ class SubscriptionManager:
     Single source of truth.
     """
 
-    TRIAL_DAYS = 7
+    TRIAL_DAYS = 3
 
     def __init__(self, app_name="MyBot", legacy_app_name=None):
         self.app_name = app_name
@@ -61,7 +61,7 @@ class SubscriptionManager:
             return "Trial expired. Please subscribe."
         return ""
 
-    def start_trial(self) -> bool:
+    def start_trial(self, initialize_db: bool = False) -> bool:
         """
         Start the trial only if no license data exists yet.
         Returns True if the trial was created, False otherwise.
@@ -69,7 +69,8 @@ class SubscriptionManager:
         if os.path.exists(self.data_file):
             return False
         self._create_trial()
-        self._ensure_database()
+        if initialize_db:
+            self._ensure_database()
         return True
 
     def activate_subscription(self, months: int = 1):
