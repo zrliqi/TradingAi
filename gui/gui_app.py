@@ -11,7 +11,7 @@ import webbrowser
 import html as html_lib
 from datetime import datetime
 from pathlib import Path
-from tkinter import messagebox, scrolledtext
+from tkinter import messagebox, scrolledtext, ttk
 from urllib.parse import parse_qs, urljoin, urlparse
 
 import requests
@@ -43,7 +43,7 @@ from app.feature_flags import build_feature_flags
 from app.db_manager import DatabaseManager
 from app.license_service import LicenseService
 from app.mode_manager import Mode, ModeManager
-from app.settings import load_settings, save_settings
+from app.settings import load_settings
 from bot.trading_bot import SignalConfig
 from all_variable import Variable
 
@@ -115,13 +115,11 @@ class TradingBotGUI:
         self.api_window = None
         self.api_keys_ready = False
         self.settings = load_settings()
+        self.settings.auto_profit_share_enabled = False
         self.license_service = LicenseService(expected_machine_id=self.machine_id)
         self.mode_manager = ModeManager(self.license_service, self.settings)
         self.mode_ctx = self.mode_manager.resolve()
         self.features = build_feature_flags(self.mode_ctx)
-        self.auto_profit_share_var = tk.BooleanVar(
-            value=self.settings.auto_profit_share_enabled
-        )
         self.public_ip_var = tk.StringVar(value="Public IP: --")
         self.ip_whitelist_var = tk.StringVar(value="IP whitelist: --")
         self._current_public_ip = ""
@@ -132,6 +130,8 @@ class TradingBotGUI:
         self._last_ip_alert_message = ""
         self._binance_api_checker = None
         self._db_update_in_progress = False
+        self.db_update_progress_var = tk.DoubleVar(value=0.0)
+        self.db_update_progress = None
 
         self.signal_var = tk.StringVar(value="Signal: --")
         self.price_var = tk.StringVar(value="BTC Price: --")
@@ -226,13 +226,6 @@ class TradingBotGUI:
         )
         self.trial_btn_visible = False
 
-        self.auto_profit_share_chk = tk.Checkbutton(
-            root,
-            text="Enable Auto Profit Share",
-            variable=self.auto_profit_share_var,
-            command=self._toggle_auto_profit_share,
-        )
-
         self.alert_var = tk.StringVar(value="Alert: --")
         self.alert_label = tk.Label(
             root,
@@ -314,13 +307,6 @@ class TradingBotGUI:
     def _open_upgrade_link(self):
         self._open_url("https://discord.gg/GHjeawSYcp")
 
-    def _toggle_auto_profit_share(self):
-        self.settings.auto_profit_share_enabled = bool(
-            self.auto_profit_share_var.get()
-        )
-        save_settings(self.settings)
-        self._refresh_mode()
-
     def _is_bot_running(self) -> bool:
         return bool(self.bot_thread and self.bot_thread.is_alive())
 
@@ -337,7 +323,6 @@ class TradingBotGUI:
 
         if self.mode_ctx.mode == Mode.PARTNER:
             self._show_api_button()
-            self._show_profit_toggle()
             self._show_ip_section()
             self.manage_license_btn.config(text="Manage License")
             self.upgrade_btn.pack_forget()
@@ -355,7 +340,6 @@ class TradingBotGUI:
             self.start_btn.config(text="Start Bot")
         else:
             self._hide_api_button()
-            self._hide_profit_toggle()
             self._hide_ip_section()
             self.manage_license_btn.config(text="Enter License")
             if not self.upgrade_btn.winfo_ismapped():
@@ -387,14 +371,6 @@ class TradingBotGUI:
         if self._api_btn_visible:
             self.manage_api_btn.pack_forget()
             self._api_btn_visible = False
-
-    def _show_profit_toggle(self):
-        if not self.auto_profit_share_chk.winfo_ismapped():
-            self.auto_profit_share_chk.pack(pady=2, before=self.alert_label)
-
-    def _hide_profit_toggle(self):
-        if self.auto_profit_share_chk.winfo_ismapped():
-            self.auto_profit_share_chk.pack_forget()
 
     def _show_ip_section(self):
         if self._ip_section_visible:
@@ -801,14 +777,63 @@ class TradingBotGUI:
             )
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        total_bytes = 0
+        try:
+            total_bytes = int(response.headers.get("Content-Length") or "0")
+        except (TypeError, ValueError):
+            total_bytes = 0
+
+        self.root.after(0, lambda: self._set_db_update_progress(0, total_bytes))
+        downloaded_bytes = 0
         with output_path.open("wb") as f:
             for chunk in response.iter_content(chunk_size=1024 * 1024):
                 if chunk:
                     f.write(chunk)
+                    downloaded_bytes += len(chunk)
+                    self.root.after(
+                        0,
+                        lambda current=downloaded_bytes, total=total_bytes: self._set_db_update_progress(
+                            current,
+                            total,
+                        ),
+                    )
         response.close()
 
         if not output_path.exists() or output_path.stat().st_size < 1024:
             raise RuntimeError("Downloaded database file is empty or too small.")
+
+    def _show_db_update_progress(self) -> None:
+        if self.db_update_progress is None or not self.db_update_progress.winfo_exists():
+            return
+        self.db_update_progress_var.set(0.0)
+        self.db_update_progress.config(mode="indeterminate", maximum=100)
+        self.db_update_progress.start(12)
+        if not self.db_update_progress.winfo_ismapped():
+            self.db_update_progress.pack(fill="x", pady=(6, 0))
+
+    def _set_db_update_progress(self, current_bytes: int, total_bytes: int) -> None:
+        if self.db_update_progress is None or not self.db_update_progress.winfo_exists():
+            return
+        if total_bytes > 0:
+            if str(self.db_update_progress.cget("mode")) != "determinate":
+                self.db_update_progress.stop()
+                self.db_update_progress.config(mode="determinate", maximum=100)
+            percent = max(0.0, min(100.0, (float(current_bytes) / float(total_bytes)) * 100.0))
+            self.db_update_progress_var.set(percent)
+        else:
+            if str(self.db_update_progress.cget("mode")) != "indeterminate":
+                self.db_update_progress.config(mode="indeterminate", maximum=100)
+                self.db_update_progress.start(12)
+        if not self.db_update_progress.winfo_ismapped():
+            self.db_update_progress.pack(fill="x", pady=(6, 0))
+
+    def _hide_db_update_progress(self) -> None:
+        if self.db_update_progress is None or not self.db_update_progress.winfo_exists():
+            return
+        self.db_update_progress.stop()
+        self.db_update_progress_var.set(0.0)
+        if self.db_update_progress.winfo_ismapped():
+            self.db_update_progress.pack_forget()
 
     def _start_partner_database_update(self):
         self._refresh_mode()
@@ -842,8 +867,8 @@ class TradingBotGUI:
             return
 
         self._db_update_in_progress = True
-        self._set_license_result("Downloading database update...", "blue")
-        self.show_alert("Downloading database update...", "orange")
+        self._show_db_update_progress()
+        self.show_alert("Database update started.", "orange")
         threading.Thread(target=self._partner_database_update_worker, daemon=True).start()
 
     def _partner_database_update_worker(self):
@@ -887,6 +912,7 @@ class TradingBotGUI:
 
     def _finish_partner_database_update(self, success: bool, message: str):
         self._db_update_in_progress = False
+        self._hide_db_update_progress()
         if success:
             self._set_license_result("Database updated successfully.", "green")
             self.show_alert("Database updated successfully.", "green")
@@ -972,8 +998,19 @@ class TradingBotGUI:
             fg=self.license_result_color,
         )
         self.license_result_label.pack()
+        self.db_update_progress = ttk.Progressbar(
+            frame,
+            variable=self.db_update_progress_var,
+            orient="horizontal",
+            mode="determinate",
+            maximum=100,
+            length=340,
+        )
+        if self._db_update_in_progress:
+            self._show_db_update_progress()
 
         def on_close():
+            self._hide_db_update_progress()
             self.license_window = None
             if self._ip_after_id is not None and not self._is_bot_running():
                 try:
