@@ -150,7 +150,7 @@ class ConditionalOrderCanceller:
         def _worker():
             try:
                 end_time = time.time() + self.BEEP_DURATION_SECONDS
-                while time.time() < end_time:
+                while time.time() < end_time and self._ip_beep_active:
                     sound.beep(repeat=1, delay=0.0)
                     time.sleep(self.BEEP_INTERVAL_SECONDS)
             finally:
@@ -158,11 +158,15 @@ class ConditionalOrderCanceller:
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    def _stop_ip_beep(self):
+        self._ip_beep_active = False
+
     # ---------- normal orders ----------
 
     def cancel_normal_stops(self):
         try:
             orders = self.client.futures_get_open_orders(symbol=self.symbol)
+            self._stop_ip_beep()
         except BinanceAPIException as e:
             if self._is_ip_whitelist_error(e):
                 ip_value = self._extract_request_ip(e) or self._get_public_ip()
@@ -210,6 +214,7 @@ class ConditionalOrderCanceller:
                     self._start_ip_beep()
             return
 
+        self._stop_ip_beep()
         for o in algo_orders:
             cancel_params = {
                 "symbol": o["symbol"],

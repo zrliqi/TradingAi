@@ -89,7 +89,7 @@ class TradingBotGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("TradingAi")
-        self.root.geometry("360x320")
+        self.root.geometry("360x380")
         self.root.resizable(False, False)
 
         self._app_icon = None
@@ -268,7 +268,7 @@ class TradingBotGUI:
         self._refresh_mode()
 
         self.root.update_idletasks()
-        desired_height = max(320, self.root.winfo_reqheight())
+        desired_height = max(380, self.root.winfo_reqheight())
         self.root.geometry(f"360x{desired_height}")
 
         self.root.deiconify()
@@ -516,6 +516,12 @@ class TradingBotGUI:
             return {"ip": current_ip, "message": msg, "color": "red", "alert": msg}
 
         if ip_restrict:
+            if not ip_list:
+                msg = (
+                    "Binance IP restriction is ON. "
+                    "Whitelist list not returned by API."
+                )
+                return {"ip": current_ip, "message": msg, "color": "orange", "alert": ""}
             if current_ip in (ip_list or set()):
                 return {
                     "ip": current_ip,

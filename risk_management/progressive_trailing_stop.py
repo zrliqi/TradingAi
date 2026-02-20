@@ -104,13 +104,16 @@ class ProgressiveTrailingStop:
         def _worker():
             try:
                 end_time = time.time() + self.BEEP_DURATION_SECONDS
-                while time.time() < end_time:
+                while time.time() < end_time and self._ip_beep_active:
                     sound.beep(repeat=1, delay=0.0)
                     time.sleep(self.BEEP_INTERVAL_SECONDS)
             finally:
                 self._ip_beep_active = False
 
         threading.Thread(target=_worker, daemon=True).start()
+
+    def _stop_ip_beep(self):
+        self._ip_beep_active = False
 
     # ---------- POSITION ----------
 
@@ -195,6 +198,7 @@ class ProgressiveTrailingStop:
                 )
 
                 pos = self.get_position()
+                self._stop_ip_beep()
 
                 # ===== NO POSITION =====
                 if not pos:

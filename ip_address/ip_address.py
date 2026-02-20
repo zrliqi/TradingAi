@@ -1,5 +1,4 @@
 ﻿import os
-import os
 import sys
 import time
 import json
@@ -22,6 +21,8 @@ except Exception:
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT_DIR not in sys.path:
     sys.path.append(ROOT_DIR)
+
+from license.licensing import DEFAULT_LICENSE_PATH
 
 DEFAULT_IP_SERVICES = [
     "https://api.ipify.org?format=json",
@@ -56,6 +57,9 @@ DEFAULT_BEEP_DURATION_SECONDS = 600
 DEFAULT_BEEP_INTERVAL_SECONDS = 4.0
 
 _IP_SPLIT_RE = re.compile(r"[,\s]+")
+_IPV4_TOKEN_RE = re.compile(r"^[0-9.]+$")
+_MIN_IPV4_LEN = 7
+_MAX_IPV4_LEN = 15
 
 
 def _parse_url_env(env_name, fallback):
@@ -81,13 +85,51 @@ def _parse_ip_tokens(raw):
     ips = set()
     for token in tokens:
         token = token.strip().lstrip("\ufeff").strip("\"'").strip()
+        token = token.split("#", 1)[0].strip()
         if not token:
             continue
         try:
             ip_obj = ipaddress.ip_address(token)
             ips.add(str(ip_obj))
+            continue
         except ValueError:
-            print(f"Invalid IP in manual whitelist ignored: {token}")
+            pass
+
+        # Recover malformed entries where two IPv4 values were appended
+        # without a separator, e.g. "1.2.3.45.6.7.8".
+        if ":" not in token and _IPV4_TOKEN_RE.fullmatch(token):
+            recovered = _recover_concatenated_ipv4(token)
+            if recovered:
+                ips.update(recovered)
+                continue
+
+        print(f"Invalid IP in manual whitelist ignored: {token}")
+    return ips
+
+
+def _recover_concatenated_ipv4(token):
+    ips = []
+    idx = 0
+    token_len = len(token)
+
+    while idx < token_len:
+        max_width = min(_MAX_IPV4_LEN, token_len - idx)
+        matched = False
+        for width in range(max_width, _MIN_IPV4_LEN - 1, -1):
+            candidate = token[idx : idx + width]
+            try:
+                ip_obj = ipaddress.ip_address(candidate)
+            except ValueError:
+                continue
+            if ip_obj.version != 4:
+                continue
+            ips.append(str(ip_obj))
+            idx += width
+            matched = True
+            break
+        if not matched:
+            idx += 1
+
     return ips
 
 
@@ -107,6 +149,19 @@ def _load_manual_whitelist(env_name, file_path):
             print(f"Failed to read manual whitelist file: {exc}")
 
     return manual_ips
+
+
+def _normalize_ip_list(values):
+    normalized = set()
+    for item in values or []:
+        token = str(item).strip().strip("\"'").strip()
+        if not token:
+            continue
+        try:
+            normalized.add(str(ipaddress.ip_address(token)))
+        except ValueError:
+            normalized.add(token)
+    return normalized
 
 
 class PublicIPResolver:
@@ -290,9 +345,9 @@ class BinanceAPI:
 
         return None
 
-    def _ensure_time_sync(self, base_url):
+    def _ensure_time_sync(self, base_url, force=False):
         now = time.time()
-        if now - self._time_offset_last_sync < self.time_sync_interval_seconds:
+        if not force and now - self._time_offset_last_sync < self.time_sync_interval_seconds:
             return
         try:
             response = self.session.get(
@@ -307,19 +362,27 @@ class BinanceAPI:
         except Exception as exc:
             print(f"Binance time sync failed: {exc}")
 
-    def _signed_request_single(self, method, base_url, endpoint, params=None):
+    def _signed_request_single(
+        self,
+        method,
+        base_url,
+        endpoint,
+        params=None,
+        retry_on_time_sync=True,
+    ):
         self._ensure_time_sync(base_url)
-        params = dict(params or {})
-        params["timestamp"] = int(time.time() * 1000) + self._time_offset_ms
-        params.setdefault("recvWindow", 5000)
-        params["signature"] = self._sign(params)
+        unsigned_params = dict(params or {})
+        signed_params = dict(unsigned_params)
+        signed_params["timestamp"] = int(time.time() * 1000) + self._time_offset_ms
+        signed_params.setdefault("recvWindow", 5000)
+        signed_params["signature"] = self._sign(signed_params)
 
         url = f"{base_url}{endpoint}"
         try:
             response = self.session.request(
                 method,
                 url,
-                params=params,
+                params=signed_params,
                 timeout=self.timeout,
             )
             status = response.status_code
@@ -337,6 +400,21 @@ class BinanceAPI:
 
             if response.ok and data is not None:
                 return data
+
+            if (
+                retry_on_time_sync
+                and isinstance(data, dict)
+                and int(data.get("code", 0)) == -1021
+            ):
+                # Binance timestamp drift: force a fresh time sync and retry once.
+                self._ensure_time_sync(base_url, force=True)
+                return self._signed_request_single(
+                    method,
+                    base_url,
+                    endpoint,
+                    params=unsigned_params,
+                    retry_on_time_sync=False,
+                )
 
             if data is not None:
                 print(
@@ -423,7 +501,7 @@ class BinanceAPI:
         else:
             ip_list = []
 
-        return ip_restrict, set(ip_list), data, error_code, error_msg
+        return ip_restrict, _normalize_ip_list(ip_list), data, error_code, error_msg
 
     def get_account_info(self):
         """Fetch Binance Futures account information."""
@@ -543,6 +621,9 @@ class IPMonitor:
         self._last_whitelist_error_msg = None
         self._last_whitelist_error_printed = None
         self._last_unwhitelisted_ip = None
+        self.whitelist_pending = False
+        self._sound_stop_event = threading.Event()
+        self._sound_thread = None
 
         self._stop_event = threading.Event()
         self._thread = None
@@ -576,6 +657,8 @@ class IPMonitor:
             self._whitelist_ips = set(ips)
             self._last_whitelist_error_code = error_code
             self._last_whitelist_error_msg = error_msg
+            if error_code == -2015:
+                self.whitelist_pending = True
             if error_code is None:
                 self._last_whitelist_error_printed = None
             elif error_code != self._last_whitelist_error_printed:
@@ -630,8 +713,21 @@ class IPMonitor:
             return
 
         try:
-            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+            file_dir = os.path.dirname(file_path)
+            if file_dir:
+                os.makedirs(file_dir, exist_ok=True)
+
+            needs_newline = False
+            if os.path.isfile(file_path):
+                with open(file_path, "rb") as f:
+                    f.seek(0, os.SEEK_END)
+                    if f.tell() > 0:
+                        f.seek(-1, os.SEEK_END)
+                        needs_newline = f.read(1) not in (b"\n", b"\r")
+
             with open(file_path, "a", encoding="utf-8") as f:
+                if needs_newline:
+                    f.write("\n")
                 f.write(f"{ip_address_str}\n")
             current_manual.add(ip_address_str)
             self._manual_whitelist = current_manual
@@ -640,22 +736,48 @@ class IPMonitor:
         except OSError as exc:
             print(f"Failed to append manual whitelist: {exc}")
 
+    def _store_whitelisted_ip(self, ip_address_str):
+        if not ip_address_str:
+            return
+
+        try:
+            data_dir = os.path.dirname(os.path.abspath(str(DEFAULT_LICENSE_PATH)))
+            os.makedirs(data_dir, exist_ok=True)
+            target_path = os.path.join(data_dir, "whitelisted_ip.txt")
+            tmp_path = f"{target_path}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                f.write(f"{ip_address_str}\n")
+            os.replace(tmp_path, target_path)
+            print("Whitelist confirmed. IP stored locally.")
+        except OSError as exc:
+            print(f"Whitelist confirmed but local IP store failed: {exc}")
+
     def _play_sound_alert(self):
         if not self.sound_alert:
             return
+        if self._sound_thread and self._sound_thread.is_alive():
+            return
+        self._sound_stop_event.clear()
 
         def _worker():
             try:
                 from sounds.sound_engine import SoundEngine
 
                 end_time = time.time() + self.beep_duration_seconds
-                while time.time() < end_time:
+                while (
+                    time.time() < end_time
+                    and not self._sound_stop_event.is_set()
+                ):
                     SoundEngine().beep(repeat=1, delay=0.0)
                     time.sleep(self.beep_interval_seconds)
             except Exception as exc:
                 print(f"Sound alert failed: {exc}")
 
-        threading.Thread(target=_worker, daemon=True).start()
+        self._sound_thread = threading.Thread(target=_worker, daemon=True)
+        self._sound_thread.start()
+
+    def _stop_sound_alert(self):
+        self._sound_stop_event.set()
 
     def _handle_change(self, current_ip):
         old_ip = self.cache.last_ip or "Unknown"
@@ -694,12 +816,26 @@ class IPMonitor:
             whitelist_list_available,
             manual_whitelist_ips,
         ) = self._get_whitelist()
+        if self.whitelist_pending and self._last_whitelist_error_code is None:
+            self._store_whitelisted_ip(current_ip)
+            self.whitelist_pending = False
         combined_whitelist = set(whitelist_ips) | set(manual_whitelist_ips)
         combined_list_available = bool(combined_whitelist)
+        whitelist_unknown = (
+            whitelist_active
+            and not combined_list_available
+            and self._last_whitelist_error_code is None
+        )
 
-        if current_ip not in combined_whitelist:
+        if current_ip not in combined_whitelist and not whitelist_unknown:
             print(f"🔹 Current Public IP: {current_ip}")
-        in_whitelist = current_ip in combined_whitelist if combined_list_available else False
+        if whitelist_unknown:
+            in_whitelist = True
+        else:
+            in_whitelist = current_ip in combined_whitelist if combined_list_available else False
+        if in_whitelist:
+            self._stop_sound_alert()
+            self._last_unwhitelisted_ip = None
         if not in_whitelist:
             if self._last_unwhitelisted_ip != current_ip:
                 self._last_unwhitelisted_ip = current_ip
@@ -708,7 +844,7 @@ class IPMonitor:
 
         change_detected = (not in_local_cache) and (
             (combined_list_available and not in_whitelist)
-            or not combined_list_available
+            or (not combined_list_available and not whitelist_unknown)
         )
         if change_detected:
             self._handle_change(current_ip)
@@ -734,6 +870,7 @@ class IPMonitor:
 
     def stop(self):
         self._stop_event.set()
+        self._stop_sound_alert()
         if self._thread:
             self._thread.join(timeout=5)
 

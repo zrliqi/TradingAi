@@ -8,6 +8,7 @@ import time
 import sqlite3
 import asyncio
 import threading
+import traceback
 from dataclasses import dataclass
 
 import requests
@@ -85,6 +86,7 @@ class TradingBot:
                 refresh_db=True,
             )
         self.signal_config = signal_config
+        self._refresh_db_enabled = bool(self.signal_config.refresh_db)
 
         self.sound = SoundEngine()
 
@@ -267,12 +269,27 @@ class TradingBot:
         self._db_not_ready_logged = False
         self._db_not_ready_alerted = False
 
-        if self.signal_config.refresh_db and self.features.database_unlocked:
-            from database.missing_data_single_symbol import MissingDataCollection
+        if self._refresh_db_enabled and self.features.database_unlocked:
+            try:
+                from database.missing_data_single_symbol import MissingDataCollection
 
-            MissingDataCollection(database=self.database).collect_missing_data_single_symbols(
-                self.target_symbol
-            )
+                MissingDataCollection(database=self.database).collect_missing_data_single_symbols(
+                    self.target_symbol
+                )
+            except ModuleNotFoundError as exc:
+                self._refresh_db_enabled = False
+                print(
+                    "[WARN] Background DB refresh disabled "
+                    f"(missing dependency: {exc}).",
+                    flush=True,
+                )
+                if self.on_alert:
+                    self.on_alert(
+                        "Background refresh disabled. Rebuild app with TA-Lib support.",
+                        "orange",
+                    )
+            except Exception as exc:
+                print(f"[WARN] Background DB refresh failed: {exc}", flush=True)
 
         final_signal = 0
         indicator_frames = []
@@ -374,7 +391,16 @@ class TradingBot:
 
         while not self._stop_event.is_set():
             loop_start = time.monotonic()
-            self._run_cycle()
+            try:
+                self._run_cycle()
+            except Exception as exc:
+                print(f"[ERROR] Trading cycle crashed: {exc}", flush=True)
+                traceback.print_exc()
+                if self.on_alert:
+                    self.on_alert(
+                        "Trading cycle error. Bot is retrying automatically.",
+                        "red",
+                    )
 
             elapsed = time.monotonic() - loop_start
             sleep_time = max(1, 60 - elapsed)

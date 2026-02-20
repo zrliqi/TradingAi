@@ -12,6 +12,7 @@ if PROJECT_ROOT not in sys.path:
 
 from binance.exceptions import BinanceAPIException
 from sounds.sound_engine import SoundEngine
+from license.licensing import DEFAULT_LICENSE_PATH
 from ip_address.ip_address import (
     PublicIPResolver,
     _load_manual_whitelist,
@@ -48,6 +49,8 @@ class MarketOrder:
         self._manual_whitelist = set()
         self._manual_whitelist_last_load = 0.0
         self._manual_whitelist_ttl = DEFAULT_MANUAL_WHITELIST_CACHE_TTL_SECONDS
+        self.whitelist_pending = False
+        self._pending_whitelist_ip = None
 
     def _extract_request_ip(self, exc):
         msg = str(exc)
@@ -120,6 +123,22 @@ class MarketOrder:
         if self.on_alert:
             self.on_alert("IP whitelist OK. Trading resumes.", "green")
 
+    def _store_whitelisted_ip(self, ip_value):
+        if not ip_value:
+            return
+
+        try:
+            data_dir = os.path.dirname(os.path.abspath(str(DEFAULT_LICENSE_PATH)))
+            os.makedirs(data_dir, exist_ok=True)
+            target_path = os.path.join(data_dir, "whitelisted_ip.txt")
+            tmp_path = f"{target_path}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                f.write(f"{ip_value}\n")
+            os.replace(tmp_path, target_path)
+            print("Whitelist confirmed. IP stored locally.")
+        except OSError as exc:
+            print(f"Whitelist confirmed but local IP store failed: {exc}", flush=True)
+
     def get_open_position(self, symbol):
         pos = self.client.futures_position_information(symbol=symbol)
         for p in pos:
@@ -134,6 +153,7 @@ class MarketOrder:
         if (
             self._balance_cache is not None
             and self._balance_cache_ts is not None
+            and not self.whitelist_pending
             and (time.monotonic() - self._balance_cache_ts) <= self.BALANCE_CACHE_TTL
         ):
             print("⚡ Using cached balance (fast path).", flush=True)
@@ -141,7 +161,13 @@ class MarketOrder:
 
         for attempt in range(1, retries + 1):
             try:
-                for b in self.client.futures_account_balance():
+                balances = self.client.futures_account_balance()
+                if self.whitelist_pending:
+                    self._store_whitelisted_ip(self._pending_whitelist_ip)
+                    self.whitelist_pending = False
+                    self._pending_whitelist_ip = None
+
+                for b in balances:
                     if b["asset"] == "USDT":
                         balance = float(b["balance"])
                         self._balance_cache = balance
@@ -155,7 +181,10 @@ class MarketOrder:
                     print("Please update IP whitelist in Binance")
                     print("Alert will continue until the IP is whitelisted")
 
-                    ip_value = self._extract_request_ip(e) or self._get_public_ip()
+                    ip_value = self._extract_request_ip(e)
+                    self.whitelist_pending = True
+                    if ip_value:
+                        self._pending_whitelist_ip = ip_value
                     if self._should_alert_for_ip(ip_value):
                         self._start_ip_alert()
                     time.sleep(base_delay * attempt)

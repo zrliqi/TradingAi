@@ -12,7 +12,6 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import sqlite3
 import numpy as np
 import pandas as pd
-from indicator.candle_pattern import MakePattern
 from indicator.rsi import Rsi
 from indicator.moving_average_signal import MovingAverage
 from indicator.macd import Macd
@@ -23,6 +22,8 @@ import warnings
 warnings.filterwarnings("ignore")
 
 class StoreData:
+    _pattern_import_warning_logged = False
+
     def __init__(self, data, connection, cur, symbol, interval=1, extra=0, extra_data=None):
         self.data = data
         self.connection = connection
@@ -31,6 +32,22 @@ class StoreData:
         self.interval = interval
         self.extra = extra
         self.extra_data = extra_data
+
+    def _build_candle_patterns(self):
+        try:
+            from indicator.candle_pattern import MakePattern
+
+            make_pattern = MakePattern()
+            if self.extra_data is not None:
+                new_data = pd.concat([self.extra_data, self.data], axis=0)
+                pattern = make_pattern.pattern(new_data)
+                return pattern.iloc[self.extra:]
+            return make_pattern.pattern(self.data)
+        except Exception as exc:
+            if not StoreData._pattern_import_warning_logged:
+                print(f"[WARN] Candle pattern generation unavailable: {exc}", flush=True)
+                StoreData._pattern_import_warning_logged = True
+            return pd.DataFrame(index=self.data.index)
 
     def store_symbol(self):
         self.cur.execute("INSERT INTO symbols (symbolName) VALUES (?) RETURNING id", (self.symbol,))
@@ -50,13 +67,7 @@ class StoreData:
         df.to_sql(f'asset_{self.interval}', self.connection, if_exists='append', index=False)
 
     def store_cryptoCandle(self, symbol_id, asset_id=None):
-        make_pattern = MakePattern()
-        if self.extra_data is not None:
-            new_data = pd.concat([self.extra_data, self.data], axis=0)
-            pattern = make_pattern.pattern(new_data)
-            pattern = pattern.iloc[self.extra:]
-        else:
-            pattern = make_pattern.pattern(self.data)
+        pattern = self._build_candle_patterns()
         pattern.insert(0, 'symbol_id', np.ones(len(pattern), dtype=np.int16) * symbol_id)
         if asset_id is None:
             asset_id = pd.read_sql(f"SELECT id FROM asset_1 WHERE symbol_id = {symbol_id}", self.connection)['id'].tolist()
